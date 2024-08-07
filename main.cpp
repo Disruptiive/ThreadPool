@@ -5,9 +5,10 @@
 #include <condition_variable>
 #include <queue>
 #include <algorithm>
+#include <future>
 #include <optional>
 
-using Task = std::function<void()>;
+using Task = std::move_only_function<void()>;
 
 class ThreadPool;
 
@@ -34,7 +35,7 @@ public:
         std::unique_lock lck(mtx);
         m_q_cv.wait(lck, st, [this] { return !q.empty(); });
         if(!st.stop_requested()) {
-            auto task = q.front();
+            auto task = std::move(q.front());
             q.pop_front();
             return std::move(task);
         }
@@ -48,11 +49,7 @@ public:
         m_q_cv.notify_one();
     }
 
-    void push(const Task& t) {
-        std::unique_lock lck(mtx);
-        q.push_back(t);
-        m_q_cv.notify_one();
-    }
+
 
     [[nodiscard]] std::size_t getSize() {
         std::unique_lock lck(mtx);
@@ -72,15 +69,23 @@ private:
 
 class ThreadPool {
 public:
-    explicit ThreadPool(std::size_t sz) : q(Queue()) {
+    explicit ThreadPool(std::size_t sz) {
         m_thread_vec.reserve(sz);
         for (auto i = 0u; i < sz; ++i) {
             m_thread_vec.emplace_back(*this);
         }
     }
 
-    void addTask(Task task) {
+    template<typename Func, typename... Args>
+    auto addTask(Func&& f, Args&&... args) {
+        using ReturnType = std::invoke_result_t<Func, Args...>;
+        std::packaged_task<ReturnType()> pt =  std::packaged_task<ReturnType()>{ std::bind(
+                std::forward<Func>(f), std::forward<Args>(args)...)
+        };
+        auto ftr = pt.get_future();
+        Task task {[pt = std::move(pt)] mutable {pt();}};
         q.push(std::move(task));
+        return ftr;
     }
 
     std::optional<Task> getTask(std::stop_token& st) {
@@ -121,14 +126,29 @@ void Worker::runKernel() {
     m_threadpool.notifyWorkerDone();
 }
 
-int main() {
-    std::atomic<int> i{0};
-    auto sample = [&i] {++i; };
-    ThreadPool tp(4);
-    for (int j = 0; j < 10405; ++j) {
-        tp.addTask(sample);
+namespace task {
+
+    template<typename Func, typename... Args>
+    auto createTask2(Func&& f, Args&&... args) {
+        using ReturnType = std::invoke_result_t<Func, Args...>;
+        return std::packaged_task<ReturnType()>{ std::bind(
+                std::forward<Func>(f), std::forward<Args>(args)...)
+        };
     }
-    tp.waitUntilFinish();
-    std::cout << "prlp " << i << " prpl" << std::endl;
+}
+int main() {
+
+    auto t1 = [](int i){return i+1;};
+    auto t2 = [](int i,int j)->int{return i+j;};
+
+    ThreadPool tp(4);
+    std::vector<std::future<int>> futures;
+    for(int i=0;i<32;++i) {
+        futures.push_back(tp.addTask(t1,rand()%20));
+        futures.push_back(tp.addTask(t2,rand()%20,rand()%42));
+    }
+    for(int i=0;i<futures.size();++i) {
+        std::cout << futures[i].get() << "\n";
+    }
     return 0;
 }
